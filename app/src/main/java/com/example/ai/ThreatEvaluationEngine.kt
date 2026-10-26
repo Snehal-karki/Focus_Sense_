@@ -234,63 +234,15 @@ class ThreatEvaluationEngine(private val customContext: Context? = null) {
                 layerNumber = 1,
                 layerName = "Layer 1: Deterministic Fast Filter",
                 executionTimeMs = l1ElapsedMs,
-                decision = "ESCALATED_TO_L2",
+                decision = "ESCALATED_TO_AI",
                 confidence = l1Result.confidence,
-                note = "Ambiguous syntax detected. Escalate to Dual On-Device ML Classifiers."
+                note = "Escalating content for deep AI threat evaluation."
             )
         )
 
         // -----------------------------------------------------------------
-        // STAGE 2: Layer 2 - Dual On-Device ML Engines (Model 1 + Model 2)
+        // STAGE 2: Cloud / External LLM Evaluation (Gemini 2.5/2.0/1.5 Flash or HuggingFace)
         // -----------------------------------------------------------------
-        val tL2Start = System.nanoTime()
-        val l2Result = evaluateLayer2MobileBertML(appName, contentTitle, extractedText)
-        val l2ElapsedMs = ((System.nanoTime() - tL2Start) / 1_000_000L).coerceAtLeast(1L)
-
-        val predictionEscalates = l2Result.confidenceScore < ThreatClassifier.THRESHOLD
-
-        if (ablationMode == ThreatAblationMode.ON_DEVICE_ML_ONLY || forceOfflineOnly || !predictionEscalates) {
-            trace.add(
-                LayerTraceStep(
-                    layerNumber = 2,
-                    layerName = "Layer 2: Dual Edge ML Engines",
-                    executionTimeMs = l2ElapsedMs,
-                    decision = if (l2Result.isFlagged) "RESOLVED_ON_EDGE" else "PASSED_ON_EDGE",
-                    confidence = l2Result.confidenceScore,
-                    note = if (!predictionEscalates) {
-                        "High edge ML confidence (${(l2Result.confidenceScore * 100).toInt()}% >= ${(ThreatClassifier.THRESHOLD * 100).toInt()}%). Resolved on edge."
-                    } else if (forceOfflineOnly) {
-                        "Offline forced mode: resolved on edge device."
-                    } else {
-                        "Ablation Mode 2: 100% on-device dual classifiers."
-                    }
-                )
-            )
-            return@withContext l2Result.copy(
-                layerTrace = trace,
-                ablationMode = ablationMode,
-                privacyTransmission = "Edge-Confined (Zero Cloud Transmission)",
-                energyImpactMicroJoules = 65L
-            )
-        }
-
-        // Low confidence (< 0.75 threshold) -> Escalate to Layer 3 Gemini Cloud AI
-        trace.add(
-            LayerTraceStep(
-                layerNumber = 2,
-                layerName = "Layer 2: Dual Edge ML Engines",
-                executionTimeMs = l2ElapsedMs,
-                decision = "ESCALATED_TO_L3",
-                confidence = l2Result.confidenceScore,
-                note = "Low edge classifier confidence (${(l2Result.confidenceScore * 100).toInt()}% < ${(ThreatClassifier.THRESHOLD * 100).toInt()}%). Escalating to Cloud Gemini LLM."
-            )
-        )
-
-        // -----------------------------------------------------------------
-        // -----------------------------------------------------------------
-        // STAGE 3: Layer 3 - Server-Side / Cloud Gemini Neural Reasoning
-        // -----------------------------------------------------------------
-        val tL3Start = System.currentTimeMillis()
         val savedApiKey = try {
             val ctx = customContext ?: FocusSenseApplication.instance
             val prefs = ctx.getSharedPreferences("focussense_prefs", Context.MODE_PRIVATE)
@@ -302,60 +254,79 @@ class ThreatEvaluationEngine(private val customContext: Context? = null) {
             ?: BuildConfig.GEMINI_API_KEY.takeIf { it.isNotBlank() && it != "MY_GEMINI_API_KEY" && it != "YOUR_GEMINI_API_KEY" }
             ?: ""
 
-        var finalL3Result: ThreatAnalysisResult? = null
-        if (apiKey.isNotBlank()) {
-            try {
-                finalL3Result = evaluateWithGemini(apiKey, appName, contentTitle, extractedText)
-            } catch (_: Exception) {}
+        val savedHfKey = try {
+            val ctx = customContext ?: FocusSenseApplication.instance
+            val prefs = ctx.getSharedPreferences("focussense_prefs", Context.MODE_PRIVATE)
+            prefs.getString("custom_hf_api_key", null)
+        } catch (_: Exception) {
+            null
         }
+        val hfKey = savedHfKey?.takeIf { it.isNotBlank() } ?: ""
 
-        if (finalL3Result == null && serverUrl.isNotBlank()) {
-            try {
-                finalL3Result = evaluateWithRenderServer(serverUrl, appName, contentTitle, extractedText)
-            } catch (_: Exception) {}
-        }
+        if (!forceOfflineOnly && ablationMode != ThreatAblationMode.ON_DEVICE_ML_ONLY) {
+            val tL3Start = System.currentTimeMillis()
+            var cloudRes: ThreatAnalysisResult? = null
 
-        val l3ElapsedMs = System.currentTimeMillis() - tL3Start
+            if (apiKey.isNotBlank()) {
+                try {
+                    cloudRes = evaluateWithGemini(apiKey, appName, contentTitle, extractedText)
+                } catch (_: Exception) {}
+            }
 
-        if (finalL3Result != null) {
-            trace.add(
-                LayerTraceStep(
-                    layerNumber = 3,
-                    layerName = "Layer 3: Cloud Gemini 3.5 Flash AI",
-                    executionTimeMs = l3ElapsedMs,
-                    decision = "CLOUD_DELIBERATED",
-                    confidence = finalL3Result.confidenceScore,
-                    note = "Cloud multimodal deliberation completed for low-confidence edge result."
+            if (cloudRes == null && hfKey.isNotBlank()) {
+                try {
+                    cloudRes = evaluateWithHuggingFace(hfKey, appName, contentTitle, extractedText)
+                } catch (_: Exception) {}
+            }
+
+            if (cloudRes == null && serverUrl.isNotBlank()) {
+                try {
+                    cloudRes = evaluateWithRenderServer(serverUrl, appName, contentTitle, extractedText)
+                } catch (_: Exception) {}
+            }
+
+            val l3ElapsedMs = System.currentTimeMillis() - tL3Start
+            if (cloudRes != null) {
+                trace.add(
+                    LayerTraceStep(
+                        layerNumber = 3,
+                        layerName = cloudRes.detectionEngine,
+                        executionTimeMs = l3ElapsedMs,
+                        decision = if (cloudRes.isFlagged) "FLAGGED_BY_AI" else "SAFE_BY_AI",
+                        confidence = cloudRes.confidenceScore,
+                        note = "Cloud LLM/NLP reasoning evaluated content."
+                    )
                 )
-            )
-            return@withContext finalL3Result.copy(
-                detectionEngine = "Cascaded Tri-Layer (L1 Rules -> L2 Dual ML -> L3 Cloud Gemini LLM)",
-                layerTrace = trace,
-                ablationMode = ablationMode,
-                privacyTransmission = "Cloud Deliberated (Escalated due to L2 Ambiguity)",
-                cognitiveRiskRadar = l2Result.cognitiveRiskRadar,
-                linguisticTriggers = l1Result.matchedKeywords,
-                energyImpactMicroJoules = 420L
-            )
+                return@withContext cloudRes.copy(
+                    layerTrace = trace,
+                    ablationMode = ablationMode,
+                    energyImpactMicroJoules = 380L
+                )
+            }
         }
 
-        // If cloud is unreachable, fall back to Layer 2 Dual ML result
+        // -----------------------------------------------------------------
+        // STAGE 3: On-Device Dual ML Classifiers (Fallback)
+        // -----------------------------------------------------------------
+        val tL2Start = System.nanoTime()
+        val l2Result = evaluateLayer2MobileBertML(appName, contentTitle, extractedText)
+        val l2ElapsedMs = ((System.nanoTime() - tL2Start) / 1_000_000L).coerceAtLeast(1L)
+
         trace.add(
             LayerTraceStep(
-                layerNumber = 3,
-                layerName = "Layer 3: Cloud Server (Fallback)",
-                executionTimeMs = l3ElapsedMs,
-                decision = "EDGE_FALLBACK",
+                layerNumber = 2,
+                layerName = "Layer 2: Dual Edge ML Engines",
+                executionTimeMs = l2ElapsedMs,
+                decision = if (l2Result.isFlagged) "RESOLVED_ON_EDGE" else "PASSED_ON_EDGE",
                 confidence = l2Result.confidenceScore,
-                note = "Cloud unreachable / offline. Gracefully resolved using Layer 2 Dual Edge ML."
+                note = "On-device dual ML classifier evaluated content."
             )
         )
 
         return@withContext l2Result.copy(
-            detectionEngine = "Layer 2: On-Device Dual ML (Offline Edge Fallback)",
             layerTrace = trace,
             ablationMode = ablationMode,
-            privacyTransmission = "Edge-Confined (Zero Cloud Transmission - Network Fallback)",
+            privacyTransmission = "Edge-Confined (Zero Cloud Transmission)",
             energyImpactMicroJoules = 65L
         )
     }
@@ -374,11 +345,12 @@ class ThreatEvaluationEngine(private val customContext: Context? = null) {
     private fun evaluateLayer1RuleFilter(text: String): Layer1Evaluation {
         val lower = text.lowercase()
 
-        // Critical crisis triggers: Self-harm, suicide, violence, weapons
+        // 1. Critical Crisis & Self-Harm Triggers
         val emergencyCrisisTriggers = listOf(
             "kill myself", "end my life", "i want to die", "commit suicide",
-            "do suicide", "suicide", "hate myself", "want to kill",
-            "cut my wrist", "harm myself", "school shooting", "bomb the school", "mass shooting"
+            "do suicide", "suicide", "hate myself", "want to kill myself",
+            "cut my wrist", "harm myself", "school shooting", "bomb the school", "mass shooting",
+            "hate my life", "i want to end it", "can't take it anymore", "cant take it anymore"
         )
         val matchedEmergency = emergencyCrisisTriggers.filter { lower.contains(it) }
         if (matchedEmergency.isNotEmpty()) {
@@ -391,11 +363,12 @@ class ThreatEvaluationEngine(private val customContext: Context? = null) {
             )
         }
 
-        // Direct personal violence threats (e.g. "i kill you", "i will kill you", "die bitch")
+        // 2. Direct Personal Violence & Threat Triggers
         val directThreatTriggers = listOf(
             "i kill you", "i will kill you", "kill you", "kill u", "i'm going to kill you",
             "die bitch", "go die", "slit your throat", "beat you up", "murder you",
-            "i will end you", "hunt you down", "gonna kill you", "beat him up", "punch in the face"
+            "i will end you", "hunt you down", "gonna kill you", "beat him up", "punch in the face",
+            "i will hit you", "i will stab you", "i'm gonna beat you"
         )
         val matchedDirectThreat = directThreatTriggers.filter { lower.contains(it) }
         if (matchedDirectThreat.isNotEmpty()) {
@@ -408,11 +381,13 @@ class ThreatEvaluationEngine(private val customContext: Context? = null) {
             )
         }
 
-        // Severe child abuse and aggressive bullying
+        // 3. Cyberbullying, Insults & Toxic Comments
         val severeAbuseTriggers = listOf(
-            "abuse", "abusive", "abusing", "bitch", "bastard", "slut", "whore",
-            "retard", "fucking idiot", "worthless trash", "hate you ugly", "nobody likes you",
-            "jump off", "disappear forever", "kill yourself"
+            "bitch", "bastard", "slut", "whore", "retard", "fucking idiot", "worthless trash",
+            "hate you ugly", "nobody likes you", "jump off", "disappear forever", "kill yourself",
+            "shut up idiot", "you are ugly", "you're ugly", "you are so fat", "fat loser",
+            "dumbass", "dickhead", "cunt", "motherfucker", "fuck off", "faggot", "you suck",
+            "get a life loser", "nobody cares about you", "piece of shit", "ugly pig"
         )
         val matchedAbuse = severeAbuseTriggers.filter { lower.contains(it) }
         if (matchedAbuse.isNotEmpty()) {
@@ -420,14 +395,35 @@ class ThreatEvaluationEngine(private val customContext: Context? = null) {
                 isDefinitiveEmergency = true,
                 isDefinitiveSafe = false,
                 matchedKeywords = matchedAbuse,
-                primaryCategory = "Cyberbullying & Abuse",
+                primaryCategory = "Cyberbullying & Harassment",
                 confidence = 0.95f
             )
         }
 
+        // 4. Predatory Grooming & Stranger Safety
+        val predatoryTriggers = listOf(
+            "don't tell your mom", "don't tell your parents", "dont tell your mom",
+            "dont tell parents", "keep it secret", "secret between us", "our little secret",
+            "send nudes", "send photos", "send pic", "meet me alone",
+            "meet me behind", "where do you live", "what's your address", "are you alone",
+            "delete this chat", "don't show your parents"
+        )
+        val matchedPredatory = predatoryTriggers.filter { lower.contains(it) }
+        if (matchedPredatory.isNotEmpty()) {
+            return Layer1Evaluation(
+                isDefinitiveEmergency = true,
+                isDefinitiveSafe = false,
+                matchedKeywords = matchedPredatory,
+                primaryCategory = "Predatory Grooming & Stranger Risk",
+                confidence = 0.95f
+            )
+        }
+
+        // 5. Explicit & Adult Content
         val explicitAdultTriggers = listOf(
             "porn", "nude", "naked", "xxx", "sexy", "nsfw", "adult content",
-            "sex video", "sex", "strip", "erotic", "onlyfans", "leaked tapes", "pornography"
+            "sex video", "strip", "erotic", "onlyfans", "leaked tapes", "pornography",
+            "hentai", "boobs", "dick pic", "pussy"
         )
         val matchedExplicit = explicitAdultTriggers.filter { lower.contains(it) }
         if (matchedExplicit.isNotEmpty()) {
@@ -440,19 +436,46 @@ class ThreatEvaluationEngine(private val customContext: Context? = null) {
             )
         }
 
+        // 6. Substance Abuse & Drugs
+        val drugTriggers = listOf(
+            "buy weed", "buy drugs", "vape", "vaping", "cocaine", "heroine", "pills",
+            "weed dealer", "cart vape", "underage drink"
+        )
+        val matchedDrugs = drugTriggers.filter { lower.contains(it) }
+        if (matchedDrugs.isNotEmpty()) {
+            return Layer1Evaluation(
+                isDefinitiveEmergency = true,
+                isDefinitiveSafe = false,
+                matchedKeywords = matchedDrugs,
+                primaryCategory = "Substance Abuse & Drugs",
+                confidence = 0.95f
+            )
+        }
+
+        // 7. Scams & Financial Fraud
+        val scamTriggers = listOf(
+            "free robux", "free vbucks", "send otp", "give password", "free giveaway coins",
+            "claim free giftcard", "enter credit card"
+        )
+        val matchedScam = scamTriggers.filter { lower.contains(it) }
+        if (matchedScam.isNotEmpty()) {
+            return Layer1Evaluation(
+                isDefinitiveEmergency = true,
+                isDefinitiveSafe = false,
+                matchedKeywords = matchedScam,
+                primaryCategory = "Scam & Phishing",
+                confidence = 0.92f
+            )
+        }
+
+        // 8. Whitelisted Safe Educational Triggers
         val safeAcademicTriggers = listOf(
             "khan academy", "mitochondria", "pythagorean theorem", "calculus homework",
-            "biology presentation", "wikipedia org", "duolingo lesson", "periodic table"
+            "biology presentation", "wikipedia org", "duolingo lesson", "periodic table",
+            "math assignment", "physics lab", "chemistry notes", "history essay"
         )
         val matchedSafe = safeAcademicTriggers.filter { lower.contains(it) }
-
-        val generalThreatTriggers = listOf(
-            "meet me alone", "don't tell your mom", "don't tell your parents", "secret between us",
-            "send photos", "cheat on test", "leak exam", "vape underage"
-        )
-        val matchedGeneral = generalThreatTriggers.filter { lower.contains(it) }
-
-        if (matchedSafe.isNotEmpty() && matchedGeneral.isEmpty()) {
+        if (matchedSafe.isNotEmpty()) {
             return Layer1Evaluation(
                 isDefinitiveEmergency = false,
                 isDefinitiveSafe = true,
@@ -462,13 +485,12 @@ class ThreatEvaluationEngine(private val customContext: Context? = null) {
             )
         }
 
-        val allHits = matchedGeneral + matchedSafe
         return Layer1Evaluation(
             isDefinitiveEmergency = false,
             isDefinitiveSafe = false,
-            matchedKeywords = allHits,
-            primaryCategory = if (matchedGeneral.isNotEmpty()) "Predatory Grooming & Stranger Risk" else "Ambiguous",
-            confidence = if (matchedGeneral.isNotEmpty()) 0.70f else 0.30f
+            matchedKeywords = emptyList(),
+            primaryCategory = "Ambiguous",
+            confidence = 0.30f
         )
     }
 
@@ -561,7 +583,15 @@ class ThreatEvaluationEngine(private val customContext: Context? = null) {
         val isM1Flagged = isM1Harmful && !pred1.escalate
         val isM2Flagged = pred2.isCyberbullying
 
-        val isFlagged = isM1Flagged || isM2Flagged
+        // Detect UNKNOWN or ambiguous out-of-vocabulary input
+        val isUnknownOrAmbiguous = pred1.label == "UNKNOWN" || pred2.needsCloudEscalation
+
+        val isFlagged = if (isUnknownOrAmbiguous) {
+            // Do NOT falsely mark UNKNOWN / ambiguous content as Safe. Flag as low-confidence suspicious for review.
+            true
+        } else {
+            isM1Flagged || isM2Flagged
+        }
 
         // Map Model 1 category
         val m1Category = when (pred1.label) {
@@ -572,7 +602,7 @@ class ThreatEvaluationEngine(private val customContext: Context? = null) {
             "SCAM_PHISHING" -> "Scam & Phishing"
             "SAFE_EDUCATIONAL" -> "Safe"
             "SAFE_GENERAL", "SOCIAL_NORMAL" -> "Safe"
-            else -> if (isM1Flagged) "Suspicious Content" else "Safe"
+            else -> if (isUnknownOrAmbiguous) "Ambiguous Content" else "Safe"
         }
 
         // Map Model 2 cyberbullying subcategory tag
@@ -585,20 +615,20 @@ class ThreatEvaluationEngine(private val customContext: Context? = null) {
             else -> pred2.label.replaceFirstChar { it.uppercase() }
         }
 
-        // Format combined Category Name showing both model labels when appropriate
+        // Format combined Category Name
         val combinedCategory = when {
-            isM1Flagged && isM2Flagged && m2SubtypeTag.isNotBlank() ->
-                "$m1Category [$m2SubtypeTag]"
-            isM1Flagged ->
-                if (m2SubtypeTag.isNotBlank()) "$m1Category [$m2SubtypeTag]" else m1Category
-            isM2Flagged && m2SubtypeTag.isNotBlank() ->
-                "Cyberbullying & Harassment [$m2SubtypeTag]"
+            isUnknownOrAmbiguous -> "Ambiguous / Suspicious Content"
+            isM1Flagged && isM2Flagged && m2SubtypeTag.isNotBlank() -> "$m1Category [$m2SubtypeTag]"
+            isM1Flagged -> if (m2SubtypeTag.isNotBlank()) "$m1Category [$m2SubtypeTag]" else m1Category
+            isM2Flagged && m2SubtypeTag.isNotBlank() -> "Cyberbullying & Harassment [$m2SubtypeTag]"
             else -> "Safe"
         }
 
-        val maxConfidence = maxOf(pred1.confidence, pred2.confidence)
+        val maxConfidence = if (isUnknownOrAmbiguous) 0.50f else maxOf(pred1.confidence, pred2.confidence)
 
         val summary = when {
+            isUnknownOrAmbiguous ->
+                "Content flagged as ambiguous / low-confidence by on-device models. Escalated for review."
             isM1Flagged && isM2Flagged ->
                 "FocusSense AI Sentinel detected $m1Category and confirmed $m2SubtypeTag cyberbullying."
             isM1Flagged ->
@@ -610,6 +640,8 @@ class ThreatEvaluationEngine(private val customContext: Context? = null) {
         }
 
         val guidance = when {
+            isUnknownOrAmbiguous ->
+                "Ambiguous phrasing detected. Review activity log with child."
             pred1.label == "GROOMING" ->
                 "Immediate check: Verify who the child is communicating with; enforce no private meetups."
             pred1.label == "SELF_HARM_VIOLENCE" ->
@@ -726,7 +758,15 @@ class ThreatEvaluationEngine(private val customContext: Context? = null) {
             put("generationConfig", genConfig)
         }
 
-        val models = listOf("gemini-2.5-flash", "gemini-1.5-flash")
+        val models = listOf(
+            "gemini-3.1-flash-lite",
+            "gemini-3.8-flash",
+            "gemini-flash-latest",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-flash-lite",
+            "gemini-1.5-flash"
+        )
         var responseBody: String? = null
         for (modelName in models) {
             try {
@@ -793,6 +833,60 @@ class ThreatEvaluationEngine(private val customContext: Context? = null) {
             restorativeDialogueScript = restorativeScript,
             energyImpactMicroJoules = 380L
         )
+    }
+
+    private fun evaluateWithHuggingFace(
+        hfKey: String,
+        appName: String,
+        contentTitle: String,
+        extractedText: String
+    ): ThreatAnalysisResult? {
+        return try {
+            val textToEvaluate = "$contentTitle $extractedText".trim()
+            val endpoint = "https://api-inference.huggingface.co/models/cardiffnlp/twitter-roberta-base-sentiment-latest"
+            val jsonPayload = JSONObject().apply {
+                put("inputs", textToEvaluate)
+            }
+            val requestBody = jsonPayload.toString().toRequestBody("application/json".toMediaType())
+            val request = Request.Builder()
+                .url(endpoint)
+                .addHeader("Authorization", "Bearer $hfKey")
+                .post(requestBody)
+                .build()
+
+            val response = httpClient.newCall(request).execute()
+            if (response.isSuccessful) {
+                val responseBody = response.body?.string() ?: return null
+                val jsonArr = JSONArray(responseBody)
+                val innerArr = jsonArr.optJSONArray(0) ?: jsonArr
+                var isNegative = false
+                var negScore = 0.0f
+                for (i in 0 until innerArr.length()) {
+                    val obj = innerArr.optJSONObject(i) ?: continue
+                    val label = obj.optString("label", "").lowercase()
+                    val score = obj.optDouble("score", 0.0).toFloat()
+                    if (label.contains("negative") || label.contains("toxic") || label.contains("label_0")) {
+                        isNegative = score >= 0.50f
+                        negScore = score
+                    }
+                }
+                if (isNegative) {
+                    ThreatAnalysisResult(
+                        isFlagged = true,
+                        threatCategory = "Cyberbullying & Harassment [NLP Transformer]",
+                        confidenceScore = negScore,
+                        aiAnalysisSummary = "Evaluated by Hugging Face Light NLP Transformer model.",
+                        parentActionGuidance = "Review toxic/negative interaction with child.",
+                        detectionEngine = "Layer 3: Hugging Face Light NLP Transformer",
+                        severityLevel = if (negScore > 0.8f) "HIGH" else "MEDIUM",
+                        recommendedAction = "PARENT_ALERT",
+                        privacyTransmission = "Cloud Deliberated (Hugging Face Inference)"
+                    )
+                } else null
+            } else null
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun evaluateWithRenderServer(

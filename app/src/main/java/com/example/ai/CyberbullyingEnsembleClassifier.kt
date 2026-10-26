@@ -13,6 +13,7 @@ data class Model2Prediction(
     val label: String,
     val confidence: Float,
     val isCyberbullying: Boolean,
+    val needsCloudEscalation: Boolean = false,
     val probabilities: Map<String, Float> = emptyMap()
 )
 
@@ -139,16 +140,27 @@ class CyberbullyingEnsembleClassifier(context: Context) {
             probMap[labels[i]] = probs[i]
         }
 
-        val bestIndex = probs.indices.maxByOrNull { probs[it] } ?: 0
+        // Softmax Margin / Delta Calculation
+        val sortedIndices = probs.indices.sortedByDescending { probs[it] }
+        val bestIndex = sortedIndices.firstOrNull() ?: 0
+        val runnerUpIndex = if (sortedIndices.size > 1) sortedIndices[1] else bestIndex
+
         val bestLabel = labels.getOrElse(bestIndex) { "not_cyberbullying" }
         val confidence = probs[bestIndex]
+        val runnerUpProb = probs[runnerUpIndex]
+        val marginGap = confidence - runnerUpProb
 
-        val isCyberbullying = bestLabel != "not_cyberbullying" && confidence >= 0.45f
+        // High-confidence on-device trigger requires >= 0.70 probability AND >= 0.20 margin gap
+        val isHighConfidenceCyberbullying = bestLabel != "not_cyberbullying" && confidence >= 0.70f && marginGap >= 0.20f
+
+        // Borderline / ambiguous scores require Cloud LLM confirmation (0.40 <= confidence < 0.70 or margin < 0.20)
+        val needsCloudEscalation = bestLabel != "not_cyberbullying" && confidence >= 0.40f && !isHighConfidenceCyberbullying
 
         return Model2Prediction(
             label = bestLabel,
             confidence = confidence,
-            isCyberbullying = isCyberbullying,
+            isCyberbullying = isHighConfidenceCyberbullying,
+            needsCloudEscalation = needsCloudEscalation,
             probabilities = probMap
         )
     }

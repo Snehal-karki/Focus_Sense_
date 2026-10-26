@@ -143,7 +143,7 @@ class AppBlockedActivity : ComponentActivity() {
         val app = application as? FocusSenseApplication ?: return false
         val expectedPin = app.repository.currentUser.value?.pin?.takeIf { it.isNotBlank() } ?: "1234"
         if (pin.trim() == expectedPin || pin.trim() == "1234") {
-            app.repository.temporarilyUnlockApp(packageName, 15)
+            app.repository.temporarilyUnlockApp(packageName, 10)
             finish()
             return true
         }
@@ -649,7 +649,7 @@ fun AppBlockedScreen(
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    text = "Parent PIN Override (Unlock 15m)",
+                    text = "Parent PIN Override (Unlock 10m Pass)",
                     fontSize = 14.sp
                 )
             }
@@ -665,7 +665,7 @@ fun AppBlockedScreen(
             text = {
                 Column {
                     Text(
-                        text = "Enter your Parent PIN to grant a 15-minute temporary access pass for $appName.",
+                        text = "Enter your Parent PIN to grant a 10-minute temporary access pass for $appName.",
                         fontSize = 13.sp
                     )
                     Spacer(modifier = Modifier.height(12.dp))

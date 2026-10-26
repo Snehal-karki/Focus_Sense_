@@ -50,6 +50,16 @@ object ScraperFilterEngine {
         Pattern.compile("^[\\p{Punct}\\s]+$")                  // Only punctuation / whitespace
     )
 
+    // Static App Chrome / Toolbar / Tab strings to ignore unless editable
+    private val STATIC_UI_CHROME = setOf(
+        "home", "subscriptions", "library", "trending", "explore", "shorts",
+        "you", "notifications", "cast", "search", "all", "gaming", "music", "news", "podcasts",
+        "live", "settings", "start chat", "new message", "start group chat", "archived",
+        "unread", "contacts", "chats", "status", "calls", "reels", "direct", "messages",
+        "activity", "profile", "feed", "for you", "following", "inbox", "create", "upload",
+        "share", "like", "dislike", "comment", "reply", "save", "download", "clip", "thanks"
+    )
+
     // Browser URL Patterns
     private val URL_PATTERN = Pattern.compile(
         "(https?://(?:www\\.|(?!www))[a-zA-Z0-9][a-zA-Z0-9-]+[a-zA-Z0-9]\\.[^\\s]{2,}|www\\.[a-zA-Z0-9][a-zA-Z0-9-]+[a-zA-Z0-9]\\.[^\\s]{2,}|https?://[^\\s]+)",
@@ -156,7 +166,11 @@ object ScraperFilterEngine {
         val retainedStrings = mutableListOf<String>()
         val extractedUrls = mutableListOf<String>()
 
-        for (node in nodes) {
+        // Prioritize user input fields (where the child is actively typing) over background UI chrome
+        val editableNodes = nodes.filter { it.isEditable && !it.isPassword && it.text.trim().length > 1 }
+        val effectiveNodes = if (editableNodes.isNotEmpty()) editableNodes else nodes
+
+        for (node in effectiveNodes) {
             // Privacy Shield: Never scrape password fields
             if (node.isPassword) {
                 noiseFiltered++
@@ -167,6 +181,13 @@ object ScraperFilterEngine {
 
             // Discard empty or single-character noise
             if (text.length <= 1) {
+                noiseFiltered++
+                continue
+            }
+
+            // Discard static app chrome (e.g. "Home", "Subscriptions", "Start Chat") unless user is typing it
+            val lowerText = text.lowercase()
+            if (!node.isEditable && STATIC_UI_CHROME.contains(lowerText)) {
                 noiseFiltered++
                 continue
             }

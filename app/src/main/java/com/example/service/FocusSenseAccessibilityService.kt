@@ -46,6 +46,12 @@ class FocusSenseAccessibilityService : AccessibilityService() {
     private var lastExtractedText = ""
     private var lastAnalyzedTime = 0L
     private var lastPkgName = ""
+    private val recentContentHashes = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    private fun computeContentHash(pkgName: String, text: String): String {
+        val clean = text.lowercase().replace("\\s+".toRegex(), " ").trim()
+        return "$pkgName:${clean.hashCode()}"
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -57,7 +63,7 @@ class FocusSenseAccessibilityService : AccessibilityService() {
             app.repository.eventStream.collect { event ->
                 if (event is SentinelEvent.ContentFlagged) {
                     val analysis = event.threatResult
-                    if (analysis.isFlagged) {
+                    if (analysis.isFlagged && !app.repository.isPackageTemporarilyUnlocked(event.log.packageName)) {
                         withContext(Dispatchers.Main) {
                             launchBlockScreen(
                                 packageName = event.log.packageName,
@@ -88,6 +94,12 @@ class FocusSenseAccessibilityService : AccessibilityService() {
         )
 
         val app = application as? FocusSenseApplication ?: return
+
+        // 0. Temporary Parent PIN Pass Check (at least 10 minutes unlock window)
+        if (app.repository.isPackageTemporarilyUnlocked(pkgName)) {
+            return
+        }
+
         val currentChildId = app.repository.selectedChildId.value
         val isChildDevice = app.repository.currentUser.value?.role == "child"
 
@@ -182,10 +194,21 @@ class FocusSenseAccessibilityService : AccessibilityService() {
 
         val fullText = filterResult.cleanText
 
-        // Avoid re-processing identical text continuously
-        if (fullText == lastExtractedText) {
+        // Smart Fingerprinting Deduplication: Enforce sliding 45s cooldown per unique message hash
+        val contentHash = computeContentHash(pkgName, fullText)
+        val lastSeenTime = recentContentHashes[contentHash] ?: 0L
+
+        if (now - lastSeenTime < 45_000L) {
             return
         }
+        recentContentHashes[contentHash] = now
+
+        // Periodically purge stale hashes older than 5 minutes
+        if (recentContentHashes.size > 200) {
+            val cutoff = now - 300_000L
+            recentContentHashes.entries.removeIf { it.value < cutoff }
+        }
+
         lastExtractedText = fullText
         lastAnalyzedTime = now
 
@@ -303,6 +326,11 @@ class FocusSenseAccessibilityService : AccessibilityService() {
         category: String,
         endTime: String
     ) {
+        val app = application as? FocusSenseApplication
+        if (app != null && app.repository.isPackageTemporarilyUnlocked(packageName)) {
+            return
+        }
+
         val now = System.currentTimeMillis()
         if (packageName == lastBlockedPkg && (now - lastBlockLaunchTime < 2000)) {
             return

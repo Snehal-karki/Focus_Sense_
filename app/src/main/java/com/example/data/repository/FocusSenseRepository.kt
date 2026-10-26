@@ -196,7 +196,7 @@ class FocusSenseRepository(context: Context) {
         return _instantBlockedPackages.value.any { it.equals(lower, ignoreCase = true) }
     }
 
-    fun temporarilyUnlockApp(packageName: String, minutes: Int = 15) {
+    fun temporarilyUnlockApp(packageName: String, minutes: Int = 10) {
         val lower = packageName.lowercase()
         _temporaryUnlockedPackages[lower] = System.currentTimeMillis() + (minutes * 60 * 1000L)
     }
@@ -671,6 +671,29 @@ class FocusSenseRepository(context: Context) {
                 ?: _selectedChildId.value.ifBlank { "child-default" }
         }
 
+        val now = System.currentTimeMillis()
+
+        // If package is temporarily unlocked under 10-minute parent PIN pass, do NOT re-flag or re-block
+        if (isPackageTemporarilyUnlocked(packageName)) {
+            val unflaggedLog = ActivityLogEntity(
+                logId = UUID.randomUUID().toString(),
+                childId = effectiveChildId,
+                packageName = packageName,
+                appName = appName,
+                contentTitle = contentTitle,
+                extractedText = extractedText,
+                isFlagged = false,
+                threatCategory = "Unlocked by Parent PIN",
+                confidenceScore = 0.0f,
+                aiAnalysisSummary = "Access allowed under temporary parent PIN pass (10-minute window).",
+                recordedAt = now,
+                isSynced = _isNetworkConnected.value,
+                isAcknowledged = true
+            )
+            db.activityLogDao().insert(unflaggedLog)
+            return@withContext unflaggedLog
+        }
+
         val analysis = threatEngine.evaluateContent(
             appName = appName,
             contentTitle = contentTitle,
@@ -678,8 +701,6 @@ class FocusSenseRepository(context: Context) {
             serverUrl = _serverUrl.value,
             forceOfflineOnly = forceOffline || !_isNetworkConnected.value
         )
-
-        val now = System.currentTimeMillis()
         val dedupKey = "$packageName:${analysis.threatCategory}"
         val lastLogged = _recentLoggedThreats[dedupKey] ?: 0L
 
